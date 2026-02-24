@@ -1,0 +1,25 @@
+# Ignore compiled files
+*.o
+*.out
+*.exe
+*.bin
+
+# Ignore build folders
+build/
+dist/
+
+# Ignore OS junk
+.DS_Store
+Thumbs.db
+
+# Ignore logs
+*.log
+
+# Ignore Mac zip junk
+__MACOSX/
+
+# Ignore images (if any diagrams/screenshots)
+images/
+
+# Ignore editor files
+.vscode/

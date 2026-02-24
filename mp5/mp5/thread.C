@@ -1,0 +1,249 @@
+/* 
+    File: thread.C
+
+    Author: R. Bettati
+            Department of Computer Science
+            Texas A&M University
+    Date  : 11/10/25
+
+
+    This code does the low-level management of kernel-level threads.
+    It supports creation of threads and low-level dispatching.
+
+    It has been developed after study of David H. Hovemeyer's "kthread"
+    code <daveho@cs.umd.edu> and uses his approach for setting up the 
+    stack of the thread upon start-up. 
+
+    Some portions of his code have been derived from David Hovemeyer's 
+    code.
+*/
+
+/*--------------------------------------------------------------------------*/
+/* DEFINES */
+/*--------------------------------------------------------------------------*/
+
+    /* -- (none) -- */
+
+/*--------------------------------------------------------------------------*/
+/* INCLUDES */
+/*--------------------------------------------------------------------------*/
+
+#include "assert.H"
+#include "console.H"
+
+#include "frame_pool.H"
+
+#include "thread.H"
+
+#include "threads_low.H"
+
+#include "scheduler.H"
+
+#include "page_table.H"
+
+
+/*--------------------------------------------------------------------------*/
+/* EXTERNS */
+/*--------------------------------------------------------------------------*/
+
+Thread * current_thread = 0;
+/* Pointer to the currently running thread. This is used by the scheduler,
+   for example. */
+
+/* -------------------------------------------------------------------------*/
+/* LOCAL DATA PRIVATE TO THREAD AND DISPATCHER CODE */
+/* -------------------------------------------------------------------------*/
+
+int Thread::nextFreePid;
+
+/* -------------------------------------------------------------------------*/
+/* LOCAL FUNCTIONS */
+/* -------------------------------------------------------------------------*/
+
+/* -------------------------------------------------------------------------*/
+/* EXPLICIT STACK OPERATIONS */
+
+inline void Thread::push(unsigned long _val) {
+    /* This function is originally borrowed from David H. Hovemeyer <daveho@cs.umd.edu> */
+    esp -= 4;
+    *((unsigned long *) esp) = _val;
+}
+
+/* -------------------------------------------------------------------------*/
+/* LOCAL FUNCTIONS TO START/SHUTDOWN THREADS. */
+
+static void thread_shutdown() {
+    /* This function should be called when the thread returns from the thread function.
+       It terminates the thread by releasing memory and any other resources held by the thread. 
+       This is a bit complicated because the thread termination interacts with the scheduler.
+     */
+
+    if (Machine::interrupts_enabled())
+    Machine::disable_interrupts();
+
+    Thread * self = Thread::CurrentThread();
+
+    Console::puts("Thread ");
+    Console::puti(self->ThreadId());
+    Console::puts(" is terminating.\n");
+    
+    extern Scheduler * SYSTEM_SCHEDULER;
+    SYSTEM_SCHEDULER->terminate(self);
+    SYSTEM_SCHEDULER->yield();
+
+    if (!Machine::interrupts_enabled())
+        Machine::enable_interrupts();
+
+    /* Let's not worry about it for now. 
+       This means that we should have non-terminating thread functions. 
+    */
+}
+
+static void thread_start() {
+     /* This function is used to release the thread for execution in the ready queue. */
+     Machine::enable_interrupts();
+     /* We need to add code, but it is probably nothing more than enabling interrupts. */
+}
+
+void Thread::setup_context(Thread_Function _tfunction){
+    /* Sets up the initial context for the given kernel-only thread. 
+       The thread is supposed the call the function _tfunction upon start.
+    */
+  
+    /* The approach and most of the code in this function are borrowed from 
+       David H. Hovemeyer <daveho@cs.umd.edu> */
+ 
+    /* -- HERE WE PUSH THE ITEMS ON THE STACK THAT ARE NEEDED FOR THE
+          THREAD TO START EXECUTION AND FOR IT TO TERMINATE CORRECTLY
+          WHEN THE THREAD FUNCTION RETURNS. */
+
+    /* Debug: Check if this is a process (has page directory) */
+    if (page_directory != nullptr) {
+        Console::puts("    Setting up process stack at virtual address: ");
+        Console::putui((unsigned int)esp);
+        Console::puts("\n");
+    }
+
+    /* ---- ARGUMENT TO THREAD FUNCTION */
+    push(0); /* At this point we don't have arguments. */
+
+    /* ---- ADDRESS OF SHUTDOWN FUNCTION */
+    push((unsigned long) &thread_shutdown);
+    /* The thread_shutdown function should be called when the thread function 
+       returns. */
+
+    /* Push the address of the thread function. */
+    push((unsigned long) _tfunction);
+
+    /* -- NOW WE NEED TO MAKE THE REST OF THE STACK LOOK LIKE AFTER AN EXCEPTION. */
+    /*
+     * The EFLAGS register will have all bits clear.
+     * The important constraint is that we want to have the IF
+     * bit clear, so that interrupts are disabled when the
+     * thread starts.
+     */
+    /* ---- EFLAGS */
+    push(0);
+    /* Clear the IF bit to disable interrupts when thread starts. */
+
+    /* ---- CS and EIP REGISTERS */
+    push(Machine::KERNEL_CS);
+    push((unsigned long) &thread_start);
+    /* In the instruction pointer (EIP) we store address of the 
+       function that will kick-start the thread. */
+
+    /* Push fake error code and interrupt number. */
+    push(0);
+    push(0);
+
+    /* Push initial values for general-purpose registers. */
+    push(0);  /* eax */
+    push(0);  /* ecx */
+    push(0);  /* edx */
+    push(0);  /* ebx */
+    push(0);  /* esp */
+    push(0);  /* ebp */
+    push(0);  /* esi */
+    push(0);  /* edi */
+
+    /*
+     * Push values for saved segment registers.
+     * Only the ds and es registers will contain valid selectors.
+     * The fs and gs registers are not used by any instruction
+     * generated by gcc.
+     */
+    push(Machine::KERNEL_DS);  /* ds */
+    push(Machine::KERNEL_DS);  /* es */
+    push(0);  /* fs */
+    push(0);  /* gs */
+
+    Console::puts("esp = "); Console::putui((unsigned int)esp); Console::puts("\n");
+
+    Console::puts("done\n");
+}
+
+/*--------------------------------------------------------------------------*/
+/* -- Thread CONSTRUCTOR -- */
+/*--------------------------------------------------------------------------*/
+
+Thread::Thread(Thread_Function _tf, char * _stack, unsigned int _stack_size, 
+               PageDirectory * _page_dir) {
+/* Construct a new thread and initialize its stack. The thread is then ready to run.
+   (The dispatcher is implemented in file "thread_scheduler".) 
+*/
+
+    /* -- INITIALIZE THREAD */
+
+    /* ---- THREAD ID */
+   
+    thread_id = nextFreePid++;
+
+    /* ---- STACK POINTER */
+
+    esp = (char*)((unsigned int)_stack + _stack_size);
+    /* RECALL: The stack starts at the end of the reserved stack memory area. */
+
+    stack = _stack;
+    stack_size = _stack_size;
+    
+    /* ---- PAGE DIRECTORY */
+    page_directory = _page_dir;
+    
+    /* -- INITIALIZE THE STACK OF THE THREAD */
+
+    setup_context(_tf);
+
+}
+
+int Thread::ThreadId() {
+    return thread_id;
+}
+
+void Thread::dispatch_to(Thread * _thread) {
+    // Disable interrupts during address-space and context switch
+    bool was_enabled = Machine::interrupts_enabled();
+    if (was_enabled) Machine::disable_interrupts();
+
+    // If target has its own page directory, switch to it (before touching its stack!)
+    if (_thread->page_directory) {
+        unsigned long new_cr3 = _thread->page_directory->get_physical_address();
+
+        // Optional: avoid redundant CR3 loads
+        unsigned long cur_cr3  = get_current_page_directory();
+        if (cur_cr3 != new_cr3) {
+            load_page_directory(new_cr3);
+        }
+    }
+
+    // Now do the low-level stack/register switch
+    threads_low_switch_to(_thread);
+
+    // Re-enable interrupts if they were enabled before
+    if (was_enabled) Machine::enable_interrupts();
+}
+       
+
+Thread * Thread::CurrentThread() {
+/* Return the currently running thread. */
+    return current_thread;
+}
